@@ -1,7 +1,6 @@
 streamlit
 pandas
 google-cloud-bigquery
-google-auth
-openpyxl
-xlsxwriter
 python-dateutil
+xlsxwriter
+openpyxl
