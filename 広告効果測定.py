@@ -1,43 +1,51 @@
+import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
+from google.oauth2 import service_account
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-import os
-import sys
-import time
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 進捗バー用ライブラリ
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = None
-
 # ============================================================
-# ★★★ 設定部分 - ここを環境に合わせて変更してください ★★★
+# ★★★ 設定部分 ★★★
 # ============================================================
-
-PROJECT_ID = "spdb-cm-cc-ichiba2"
-INPUT_FILE = r"C:\Users\yutaro.abe\Desktop\効果測定PJT\広告効果測定用\効果測定インポート用.xlsx"
-OUTPUT_FILE = r"C:\Users\yutaro.abe\Desktop\効果測定PJT\広告効果測定用\効果測定結果.csv"
-
-# 並列実行数
+# プロジェクトIDはここで指定するか、secretsで管理してもOKです
+DEFAULT_PROJECT_ID = "spdb-cm-cc-ichiba2"
 MAX_WORKERS = 8 
 
 # ============================================================
+# 関数定義
+# ============================================================
+
+def get_bigquery_client():
+    """
+    Streamlit CloudのSecretsから認証情報を取得してClientを作成する
+    """
+    try:
+        # st.secrets["gcp_service_account"] にJSONの中身を定義することを想定
+        key_dict = st.secrets["gcp_service_account"]
+        creds = service_account.Credentials.from_service_account_info(key_dict)
+        client = bigquery.Client(credentials=creds, project=DEFAULT_PROJECT_ID)
+        return client
+    except Exception as e:
+        st.error(f"認証エラー: secretsの設定を確認してください。\n詳細: {e}")
+        return None
 
 def create_query(anken_id_val, shop_id, item_id, easy_id_list, start_date, end_date):
-    """BigQueryクエリを生成する（変更なし）"""
+    """BigQueryクエリを生成する"""
     
     easy_id_str = ', '.join(map(str, easy_id_list)) if easy_id_list else 'NULL' 
     
     # 日付オブジェクトへの変換
     start_date_dt = datetime.strptime(start_date, '%Y-%m-%d')
-    end_date_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    # end_date変数は使われていないが、ロジック維持のため保持
     
     # --- 日付計算ロジック ---
-    # sale_end_datetime: E列 + 1日 00:00:00
-    sale_end_date = (end_date_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+    # sale_end_datetime: E列(終了日) + 1日 00:00:00
+    end_date_dt_origin = datetime.strptime(end_date, '%Y-%m-%d')
+    sale_end_date = (end_date_dt_origin + timedelta(days=1)).strftime('%Y-%m-%d')
+    
     # end_datetime: D列(開始日) の1ヶ月後 00:00:00
     end_date_plus1month = (start_date_dt + relativedelta(months=1)).strftime('%Y-%m-%d')
     
@@ -47,7 +55,6 @@ def create_query(anken_id_val, shop_id, item_id, easy_id_list, start_date, end_d
 DECLARE shopid, itemid INT64;
 DECLARE easyid ARRAY<INT64>;
 DECLARE start_datetime, end_datetime, sale_start_datetime, sale_end_datetime datetime;
-
 -- パラメータ設定
 SET shopid = {shop_id};
 SET itemid = {item_id};
@@ -67,29 +74,24 @@ WHERE reg_datetime >= DATE_ADD(start_datetime,INTERVAL -365 DAY)
   AND NOT EXISTS(SELECT *  FROM `spdb-data.ua_view_mk_ichiba.illegal_order` y  WHERE x.order_no = y.order_number)
   AND shop_id = shopid
 )
-
 SELECT distinct a.easy_id,
        a.fullname,
        (case when Sale_GMS is null then 0 else Sale_GMS end) as Sale_GMS,
        (case when Sale_GMS_ROOM is null then 0 else Sale_GMS_ROOM end) as Sale_GMS_ROOM,
        (case when Monthly_GMS is null then 0 else Monthly_GMS end) as Monthly_GMS,
        (case when Monthly_GMS_ROOM is null then 0 else Monthly_GMS_ROOM end) as Monthly_GMS_ROOM,
-
        (case when Sale_Order is null then 0 else Sale_Order end) as Sale_Order,
        (case when Sale_Order_ROOM is null then 0 else Sale_Order_ROOM end) as Sale_Order_ROOM,
        (case when Monthly_Order is null then 0 else Monthly_Order end) as Monthly_Order,
        (case when Monthly_Order_ROOM is null then 0 else Monthly_Order_ROOM end) as Monthly_Order_ROOM,
-
        (case when Sale_Purchaser is null then 0 else Sale_Purchaser end) as Sale_Purchaser,
        (case when Sale_Purchaser_ROOM is null then 0 else Sale_Purchaser_ROOM end) as Sale_Purchaser_ROOM,
        (case when Monthly_Purchaser is null then 0 else Monthly_Purchaser end) as Monthly_Purchaser,
        (case when Monthly_Purchaser_ROOM is null then 0 else Monthly_Purchaser_ROOM end) as Monthly_Purchaser_ROOM,
-
        (case when Sale_Purchaser_New is null then 0 else Sale_Purchaser_New end) as Sale_Purchaser_New,
        (case when Sale_Purchaser_ROOM_New is null then 0 else Sale_Purchaser_ROOM_New end) as Sale_Purchaser_ROOM_New,
        (case when Monthly_Purchaser_New is null then 0 else Monthly_Purchaser_New end) as Monthly_Purchaser_New,
        (case when Monthly_Purchaser_ROOM_New is null then 0 else Monthly_Purchaser_ROOM_New end) as Monthly_Purchaser_ROOM_New,
-
        (case when Sale_Item_GMS is null then 0 else Sale_Item_GMS end) as Sale_Item_GMS,
        (case when Sale_Item_GMS_ROOM is null then 0 else Sale_Item_GMS_ROOM end) as Sale_Item_GMS_ROOM,
        (case when Monthly_Item_GMS is null then 0 else Monthly_Item_GMS end) as Monthly_Item_GMS,
@@ -99,12 +101,10 @@ SELECT distinct a.easy_id,
        (case when Sale_Click_ROOM is null then 0 else Sale_Click_ROOM end) as Sale_Click_ROOM,
        (case when Monthly_Click is null then 0 else Monthly_Click end) as Monthly_Click,
        (case when Monthly_Click_ROOM is null then 0 else Monthly_Click_ROOM end) as Monthly_Click_ROOM,
-
        (case when Sale_Item_Click is null then 0 else Sale_Item_Click end) as Sale_Item_Click,
        (case when Sale_Item_Click_ROOM is null then 0 else Sale_Item_Click_ROOM end) as Sale_Item_Click_ROOM,
        (case when Monthly_Item_Click is null then 0 else Monthly_Item_Click end) as Monthly_Item_Click,
        (case when Monthly_Item_Click_ROOM is null then 0 else Monthly_Item_Click_ROOM end) as Monthly_Item_Click_ROOM
-
 FROM (
   SELECT distinct easy_id, fullname
   FROM (SELECT easy_id, fullname, ROW_NUMBER() OVER (PARTITION BY easy_id ORDER BY time_stamp DESC) rn
@@ -112,19 +112,16 @@ FROM (
   where rn = 1 and
         easy_id in UNNEST(easyid)
 ) a
-
 LEFT JOIN (
   SELECT distinct af_id,
           sum(case when dt >= cast(sale_start_datetime as date) and dt < cast(sale_end_datetime as date) then click_num else 0 end) as Sale_Click,
           sum(case when dt >= cast(sale_start_datetime as date) and dt < cast(sale_end_datetime as date) and pointback_prefix = '_RTroom' then click_num else 0 end) as Sale_Click_ROOM,
           sum(click_num) as Monthly_Click,
           sum(case when pointback_prefix = '_RTroom' then click_num else 0 end) as Monthly_Click_ROOM,
-
           sum(case when dt >= cast(sale_start_datetime as date) and dt < cast(sale_end_datetime as date) and item_id = itemid then click_num else 0 end) as Sale_Item_Click,
           sum(case when dt >= cast(sale_start_datetime as date) and dt < cast(sale_end_datetime as date) and pointback_prefix = '_RTroom'  and item_id = itemid then click_num else 0 end) as Sale_Item_Click_ROOM,
           sum(case when item_id = itemid then click_num else 0 end) as Monthly_Item_Click,
           sum(case when pointback_prefix = '_RTroom' and item_id = itemid then click_num else 0 end) as Monthly_Item_Click_ROOM
-
   FROM `spdb-data.ua_view_mk_afl.click_log_summary`
   WHERE af_id in UNNEST(easyid) and
         shop_id = shopid and
@@ -133,34 +130,28 @@ LEFT JOIN (
   GROUP BY 1
   ) b
 ON a.easy_id = b.af_id
-
 LEFT JOIN (
   SELECT distinct easy_id,
           sum(case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime then (unit_price * quantity) else 0 end) as Sale_GMS,
           sum(case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and log_pointback like '_RTroom%' then (unit_price * quantity) else 0 end) as Sale_GMS_ROOM,
           sum((unit_price * quantity)) as Monthly_GMS,
           sum(case when log_pointback like '_RTroom%' then (unit_price * quantity) else 0 end) as Monthly_GMS_ROOM,
-
           count(distinct case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime then log_oid else null end) as Sale_Order,
           count(distinct case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and log_pointback like '_RTroom%' then log_oid else null end) as Sale_Order_ROOM,
           count(distinct log_oid) as Monthly_Order,
           count(distinct case when log_pointback like '_RTroom%' then log_oid else null end) as Monthly_Order_ROOM,
-
           count(distinct case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and purchase_user_id > 0 then purchase_user_id else null end) as Sale_Purchaser,
           count(distinct case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and purchase_user_id > 0 and log_pointback like '_RTroom%' then purchase_user_id else null end) as Sale_Purchaser_ROOM,
           count(distinct case when purchase_user_id > 0 then purchase_user_id else null end) as Monthly_Purchaser,
           count(distinct case when purchase_user_id > 0 and log_pointback like '_RTroom%' then purchase_user_id else null end) as Monthly_Purchaser_ROOM,
-
           count(distinct case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and purchase_user_id > 0 and purchase_user_id not in (select * from shop_purchaser_tbl) then purchase_user_id else null end) as Sale_Purchaser_New,
           count(distinct case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and purchase_user_id > 0 and purchase_user_id not in (select * from shop_purchaser_tbl) and log_pointback like '_RTroom%' then purchase_user_id else null end) as Sale_Purchaser_ROOM_New,
           count(distinct case when purchase_user_id > 0 and purchase_user_id not in (select * from shop_purchaser_tbl) then purchase_user_id else null end) as Monthly_Purchaser_New,
           count(distinct case when purchase_user_id > 0 and purchase_user_id not in (select * from shop_purchaser_tbl) and log_pointback like '_RTroom%' then purchase_user_id else null end) as Monthly_Purchaser_ROOM_New,
-
           sum(case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and item_id = itemid then (unit_price * quantity) else 0 end) as Sale_Item_GMS,
           sum(case when log_resulttime >= sale_start_datetime and log_resulttime < sale_end_datetime and log_pointback like '_RTroom%' and item_id = itemid then (unit_price * quantity) else 0 end) as Sale_Item_GMS_ROOM,
           sum(case when item_id = itemid then (unit_price * quantity) else 0 end) as Monthly_Item_GMS,
           sum(case when log_pointback like '_RTroom%' and item_id = itemid then (unit_price * quantity) else 0 end) as Monthly_Item_GMS_ROOM
-
   FROM `spdb-data.ua_view_mk_afl.result_goods_n`
   WHERE easy_id in UNNEST(easyid) and
         me_id = (1000000 + shopid) and
@@ -176,12 +167,8 @@ ORDER BY 3 desc;
 """
     return query
 
-
 def process_single_group(client, group_data, passthrough_cols):
-    """
-    1つのグループに対する処理（並列実行用）
-    passthrough_cols: 自動転記する列名のリスト
-    """
+    """1つのグループに対する処理"""
     try:
         idx, group_key, group = group_data
         anken_id, anken_name, shop_id, item_id, start_date, end_date = group_key
@@ -191,6 +178,7 @@ def process_single_group(client, group_data, passthrough_cols):
         if not easy_id_list:
             return None
 
+        # 日付型を文字列に変換（Excel読み込み時にTimestamp型になっている可能性があるため）
         start_date_str = pd.to_datetime(start_date).strftime('%Y-%m-%d')
         end_date_str = pd.to_datetime(end_date).strftime('%Y-%m-%d')
         
@@ -221,137 +209,155 @@ def process_single_group(client, group_data, passthrough_cols):
             result_df['紹介開始日'] = start_date_str
             result_df['紹介終了日'] = end_date_str
             
-            # ★★★ 自動転記ロジック ★★★
-            # グループ内の最初の行から値を取得して全行にコピー
-            reward_amount = 0 # 確定報酬金額の初期化
+            # 自動転記ロジック
+            reward_amount = 0
             for col in passthrough_cols:
                 val = group[col].iloc[0]
                 result_df[col] = val
                 
-                # 「確定報酬金額」列の値を取得しておく（カラム名が異なる場合は適宜修正してください）
                 if col == '確定報酬金額':
                     reward_amount = pd.to_numeric(val, errors='coerce')
 
-            # ★★★ ROAS計算ロジック（ここを修正しました）★★★
-            # 確定報酬金額が有効な数値の場合のみ計算
+            # ROAS計算ロジック
             if pd.notna(reward_amount) and reward_amount > 0:
-                # 計算結果をパーセント表記の文字列に変換（整数部分のみ表示）
                 result_df['個別ROAS'] = ((result_df['Sale_GMS'] / reward_amount) * 100).fillna(0).astype(int).astype(str) + '%'
                 result_df['個別Monthly ROAS'] = ((result_df['Monthly_GMS'] / reward_amount) * 100).fillna(0).astype(int).astype(str) + '%'
             else:
-                # 報酬金額が0または無効な場合は"0%"を設定
                 result_df['個別ROAS'] = "0%"
                 result_df['個別Monthly ROAS'] = "0%"
             
             return result_df
         else:
             return None
-
     except Exception as e:
-        print(f"\n[Error] AnkenID:{anken_id} - {str(e)}")
+        # Streamlitではprintは見えないため、エラー情報を返すかログに残す
         return None
 
+def to_excel_bytes(df):
+    """DataFrameをExcelバイト列に変換する"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
+
+# ============================================================
+# Main (Streamlit UI)
+# ============================================================
 
 def main():
-    """メイン処理"""
-    print("=" * 80)
-    print("BigQueryクエリ実行スクリプト - 効果測定PJT（並列高速化・動的カラム対応版）")
-    print(f"並列数: {MAX_WORKERS}")
-    print("=" * 80)
-    
-    # 1. 入力ファイルの読み込み
-    print(f"1. 入力ファイルを読み込み中... {INPUT_FILE}")
-    try:
-        df_input = pd.read_excel(INPUT_FILE)
-    except Exception as e:
-        print(f"エラー: {e}")
-        sys.exit(1)
-    
-    # 列名の整理
-    df_input.columns = df_input.columns.str.strip()
-    column_rename_map = {
-        'EasyID': 'easy_id', 'shopID': 'shop_id', 'itemID': 'item_id',
-        'SNS紹介開始日': '紹介開始日', 'SNS紹介終了日': '紹介終了日'
-    }
-    actual_rename_map = {k: v for k, v in column_rename_map.items() if k in df_input.columns}
-    df_input = df_input.rename(columns=actual_rename_map)
+    st.set_page_config(page_title="効果測定BQ抽出ツール", layout="wide")
+    st.title("📊 広告効果測定 BigQuery抽出ツール")
+    st.markdown("""
+    Excelファイルをアップロードすると、BigQueryから効果測定データを抽出し、
+    ROAS計算を行った結果をExcelとしてダウンロードできます。
+    """)
 
-    # 案件IDの文字列化
-    if '案件ID' in df_input.columns:
-        df_input['案件ID'] = df_input['案件ID'].astype(str).str.strip()
+    # サイドバー設定
+    st.sidebar.header("設定")
+    project_id = st.sidebar.text_input("Project ID", value=DEFAULT_PROJECT_ID)
 
-    # ★★★ 動的カラム検出ロジック ★★★
-    # グループ化や集計に使わない、その他の列（付加情報）を特定する
-    grouping_keys = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
-    exclude_keys = ['easy_id'] # 集計対象なので除外
-    
-    # 入力Excelにある列のうち、グループキーでもeasy_idでもない列をリストアップ
-    passthrough_cols = [c for c in df_input.columns if c not in grouping_keys and c not in exclude_keys]
-    
-    print(f"   ★ 自動検出された付加情報カラム: {passthrough_cols}")
-    print("      （確定報酬、担当、店舗URLなどがここに含まれます）")
+    # ファイルアップロード
+    uploaded_file = st.file_uploader("インポート用Excelファイルをアップロードしてください", type=['xlsx'])
 
-    # 2. データのグループ化
-    grouped = df_input.groupby(grouping_keys)
-    total_groups = len(grouped)
-    print(f"   対象グループ数: {total_groups}")
+    if uploaded_file is not None:
+        try:
+            df_input = pd.read_excel(uploaded_file)
+            st.success("ファイル読み込み成功！")
+            
+            # 列名の整理
+            df_input.columns = df_input.columns.str.strip()
+            column_rename_map = {
+                'EasyID': 'easy_id', 'shopID': 'shop_id', 'itemID': 'item_id',
+                'SNS紹介開始日': '紹介開始日', 'SNS紹介終了日': '紹介終了日'
+            }
+            actual_rename_map = {k: v for k, v in column_rename_map.items() if k in df_input.columns}
+            df_input = df_input.rename(columns=actual_rename_map)
 
-    # 3. BigQueryクライアント
-    try:
-        client = bigquery.Client(project=PROJECT_ID)
-    except Exception as e:
-        print(f"BQ接続エラー: {e}")
-        sys.exit(1)
+            # 案件IDの文字列化
+            if '案件ID' in df_input.columns:
+                df_input['案件ID'] = df_input['案件ID'].astype(str).str.strip()
 
-    # 4. 並列処理でクエリ実行
-    print("4. クエリを並列実行中...")
-    all_results = []
-    
-    # グループデータをリスト化
-    group_data_list = [(i, k, v) for i, (k, v) in enumerate(grouped, 1)]
+            # データプレビュー
+            st.subheader("アップロードデータ（プレビュー）")
+            st.dataframe(df_input.head())
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # passthrough_cols も引数として渡す
-        futures = [executor.submit(process_single_group, client, data, passthrough_cols) for data in group_data_list]
-        
-        if tqdm:
-            iterator = tqdm(as_completed(futures), total=len(futures), unit="query")
-        else:
-            iterator = as_completed(futures)
+            # 実行ボタン
+            if st.button("集計実行"):
+                # BQクライアント初期化
+                client = get_bigquery_client()
+                if not client:
+                    st.stop()
 
-        for future in iterator:
-            res = future.result()
-            if res is not None:
-                all_results.append(res)
+                # グループ化処理
+                grouping_keys = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
+                exclude_keys = ['easy_id']
+                
+                # 必須カラムチェック
+                missing_cols = [col for col in grouping_keys + ['easy_id'] if col not in df_input.columns]
+                if missing_cols:
+                    st.error(f"必須カラムが不足しています: {missing_cols}")
+                    st.stop()
 
-    # 5. 結果の結合と保存
-    print("\n5. 結果を結合・保存中...")
-    if not all_results:
-        print("結果が0件でした。")
-        sys.exit(0)
+                passthrough_cols = [c for c in df_input.columns if c not in grouping_keys and c not in exclude_keys]
+                
+                grouped = df_input.groupby(grouping_keys)
+                total_groups = len(grouped)
+                
+                st.info(f"対象グループ数: {total_groups} 件のクエリを実行します...")
 
-    df_final = pd.concat(all_results, ignore_index=True)
+                # プログレスバー
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                all_results = []
+                group_data_list = [(i, k, v) for i, (k, v) in enumerate(grouped, 1)]
+                
+                # 並列処理実行
+                completed_count = 0
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    # process_single_groupにclientを渡す
+                    futures = [executor.submit(process_single_group, client, data, passthrough_cols) for data in group_data_list]
+                    
+                    for future in as_completed(futures):
+                        res = future.result()
+                        if res is not None:
+                            all_results.append(res)
+                        
+                        completed_count += 1
+                        progress_bar.progress(completed_count / total_groups)
+                        status_text.text(f"処理中... {completed_count}/{total_groups} 完了")
 
-    # 列順序の整理（動的カラムを基本情報の後に挿入）
-    fixed_headers = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
-    user_headers = ['easy_id', 'fullname']
-    
-    # 数値データ（BigQueryから返ってきたその他のカラム）
-    # ROAS系カラムを除外して取得
-    metric_headers = [c for c in df_final.columns if c not in fixed_headers and c not in passthrough_cols and c not in user_headers and c not in ['個別ROAS', '個別Monthly ROAS']]
-    
-    # 最終的な並び順 (ROASを最後に追加)
-    final_order = fixed_headers + passthrough_cols + user_headers + metric_headers + ['個別ROAS', '個別Monthly ROAS']
-    final_order = [c for c in final_order if c in df_final.columns] # 存在チェック
-    
-    df_final = df_final[final_order]
+                # 結果処理
+                if not all_results:
+                    st.warning("条件に合致するデータが0件でした。")
+                else:
+                    df_final = pd.concat(all_results, ignore_index=True)
+                    
+                    # 列順序の整理
+                    fixed_headers = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
+                    user_headers = ['easy_id', 'fullname']
+                    metric_headers = [c for c in df_final.columns if c not in fixed_headers and c not in passthrough_cols and c not in user_headers and c not in ['個別ROAS', '個別Monthly ROAS']]
+                    
+                    final_order = fixed_headers + passthrough_cols + user_headers + metric_headers + ['個別ROAS', '個別Monthly ROAS']
+                    final_order = [c for c in final_order if c in df_final.columns]
+                    
+                    df_final = df_final[final_order]
 
-    try:
-        df_final.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
-        print(f"✓ 保存完了: {OUTPUT_FILE}")
-        print(f"取得行数: {len(df_final)}")
-    except Exception as e:
-        print(f"保存エラー: {e}")
+                    st.success("集計完了！")
+                    st.subheader("集計結果プレビュー")
+                    st.dataframe(df_final.head())
+                    
+                    # ダウンロードボタン
+                    excel_data = to_excel_bytes(df_final)
+                    st.download_button(
+                        label="Excelファイルをダウンロード",
+                        data=excel_data,
+                        file_name="効果測定結果.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+
+        except Exception as e:
+            st.error(f"エラーが発生しました: {e}")
 
 if __name__ == "__main__":
     main()
