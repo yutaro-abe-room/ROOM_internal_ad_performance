@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import io
 import time
+import json  # 追加
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ページ設定
@@ -259,17 +260,15 @@ if uploaded_file is not None:
 
     # 実行ボタン
     if st.button("集計開始"):
-        # BigQueryクライアント初期化 (Secrets対応)
+        # BigQueryクライアント初期化 (Secrets対応 - JSON文字列パース版)
         try:
             # Streamlit CloudのSecretsから認証情報を取得
-            if "gcp_service_account" in st.secrets:
-                # 辞書として取得 (SecretsがDictLikeである場合に対応)
-                key_dict = dict(st.secrets["gcp_service_account"])
+            # キー名を 'gcp_service_account_json' に変更
+            if "gcp_service_account_json" in st.secrets:
+                # 文字列として取得してJSONパース
+                json_str = st.secrets["gcp_service_account_json"]
+                key_dict = json.loads(json_str)
                 
-                # private_keyの改行コードを修正 (\nという文字を実際の改行に置換)
-                if "private_key" in key_dict:
-                    key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
-
                 creds = service_account.Credentials.from_service_account_info(key_dict)
                 client = bigquery.Client(credentials=creds, project=PROJECT_ID)
             else:
@@ -279,7 +278,7 @@ if uploaded_file is not None:
                 
         except Exception as e:
             st.error(f"BigQuery接続エラー: {e}")
-            st.info("Secretsに 'gcp_service_account' が設定されているか確認してください。")
+            st.info("Secretsに 'gcp_service_account_json' が設定されているか確認してください。")
             st.stop()
 
         progress_bar = st.progress(0)
