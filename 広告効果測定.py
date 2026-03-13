@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import io
 import time
-import json  # 追加
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ページ設定
@@ -229,8 +229,8 @@ def process_single_group(client, group_data, passthrough_cols):
             return None
 
     except Exception as e:
-        print(f"[Error] AnkenID:{anken_id} - {str(e)}")
-        return None
+        # エラー発生時はエラー情報を返す
+        return {"error": str(e), "anken_id": anken_id}
 
 # ============================================================
 # メイン処理 (Streamlit UI)
@@ -260,34 +260,28 @@ if uploaded_file is not None:
 
     # 実行ボタン
     if st.button("集計開始"):
-        # BigQueryクライアント初期化 (Secrets対応 - JSON文字列パース版)
+        # BigQueryクライアント初期化
         try:
-            # Streamlit CloudのSecretsから認証情報を取得
-            # キー名を 'gcp_service_account_json' に変更
             if "gcp_service_account_json" in st.secrets:
-                # 文字列として取得してJSONパース
                 json_str = st.secrets["gcp_service_account_json"]
                 key_dict = json.loads(json_str)
-                
                 creds = service_account.Credentials.from_service_account_info(key_dict)
                 client = bigquery.Client(credentials=creds, project=PROJECT_ID)
             else:
-                # ローカル環境などでSecretsがない場合は、デフォルト認証(gcloud auth login)を試行
                 client = bigquery.Client(project=PROJECT_ID)
                 st.info("ローカル認証情報を使用しています。")
-                
         except Exception as e:
             st.error(f"BigQuery接続エラー: {e}")
-            st.info("Secretsに 'gcp_service_account_json' が設定されているか確認してください。")
+            st.info("Secrets設定を確認してください。")
             st.stop()
 
         progress_bar = st.progress(0)
         status_text = st.empty()
+        error_logs = []
 
         # --- 前処理 ---
         status_text.text("データを前処理中...")
         
-        # 列名の整理
         df_input.columns = df_input.columns.str.strip()
         column_rename_map = {
             'EasyID': 'easy_id', 'shopID': 'shop_id', 'itemID': 'item_id',
@@ -296,16 +290,13 @@ if uploaded_file is not None:
         actual_rename_map = {k: v for k, v in column_rename_map.items() if k in df_input.columns}
         df_input = df_input.rename(columns=actual_rename_map)
 
-        # 案件IDの文字列化
         if '案件ID' in df_input.columns:
             df_input['案件ID'] = df_input['案件ID'].astype(str).str.strip()
 
-        # 動的カラム検出
         grouping_keys = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
         exclude_keys = ['easy_id']
         passthrough_cols = [c for c in df_input.columns if c not in grouping_keys and c not in exclude_keys]
         
-        # データのグループ化
         grouped = df_input.groupby(grouping_keys)
         total_groups = len(grouped)
         st.info(f"対象グループ数: {total_groups}")
@@ -322,7 +313,11 @@ if uploaded_file is not None:
             for future in as_completed(futures):
                 res = future.result()
                 if res is not None:
-                    all_results.append(res)
+                    if isinstance(res, dict) and "error" in res:
+                        # エラー情報を収集
+                        error_logs.append(f"案件ID: {res['anken_id']} - Error: {res['error']}")
+                    else:
+                        all_results.append(res)
                 
                 completed_count += 1
                 progress = completed_count / total_groups
@@ -330,13 +325,17 @@ if uploaded_file is not None:
                 status_text.text(f"処理中... {completed_count}/{total_groups} 完了")
 
         # --- 結果結合と出力 ---
+        if error_logs:
+            st.error("以下のエラーが発生しました:")
+            for log in error_logs:
+                st.write(log)
+
         if not all_results:
-            st.warning("結果が0件でした。条件に合致するデータがないか、エラーが発生しました。")
+            st.warning("有効な結果が0件でした。")
         else:
             status_text.text("結果ファイルを作成中...")
             df_final = pd.concat(all_results, ignore_index=True)
 
-            # 列順序の整理
             fixed_headers = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
             user_headers = ['easy_id', 'fullname']
             metric_headers = [c for c in df_final.columns if c not in fixed_headers and c not in passthrough_cols and c not in user_headers and c not in ['個別ROAS', '個別Monthly ROAS']]
@@ -346,14 +345,12 @@ if uploaded_file is not None:
             
             df_final = df_final[final_order]
 
-            # Excelファイルをメモリ上に作成
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 df_final.to_excel(writer, index=False)
             
             buffer.seek(0)
             
-            # ダウンロードボタン表示
             st.success("集計完了！以下のボタンからダウンロードしてください。")
             st.download_button(
                 label="結果Excelをダウンロード",
