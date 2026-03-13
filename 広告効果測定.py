@@ -5,12 +5,12 @@ from google.oauth2 import service_account
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # ★★★ 設定部分 ★★★
 # ============================================================
-# プロジェクトIDはここで指定するか、secretsで管理してもOKです
 DEFAULT_PROJECT_ID = "spdb-cm-cc-ichiba2"
 MAX_WORKERS = 8 
 
@@ -21,10 +21,16 @@ MAX_WORKERS = 8
 def get_bigquery_client():
     """
     Streamlit CloudのSecretsから認証情報を取得してClientを作成する
+    SecretsにはJSON文字列として保存されていることを想定
     """
     try:
-        # st.secrets["gcp_service_account"] にJSONの中身を定義することを想定
-        key_dict = st.secrets["gcp_service_account"]
+        # secrets.toml の [gcp_service_account] セクションから "key" という値を取得
+        # key = """ { ...JSONの中身... } """ のように定義されている想定
+        key_str = st.secrets["gcp_service_account"]["key"]
+        
+        # 文字列をJSON辞書に変換
+        key_dict = json.loads(key_str)
+        
         creds = service_account.Credentials.from_service_account_info(key_dict)
         client = bigquery.Client(credentials=creds, project=DEFAULT_PROJECT_ID)
         return client
