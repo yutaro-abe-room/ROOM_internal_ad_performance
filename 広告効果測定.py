@@ -1,33 +1,44 @@
-import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
-from google.oauth2 import service_account
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-import io
+import os
+import sys
 import time
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ページ設定
-st.set_page_config(page_title="広告効果測定BQツール", layout="wide")
+# 進捗バー用ライブラリ
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 # ============================================================
-# 関数定義
+# ★★★ 設定部分 - ここを環境に合わせて変更してください ★★★
+# ============================================================
+
+PROJECT_ID = "spdb-cm-cc-ichiba2"
+INPUT_FILE = r"C:\Users\yutaro.abe\Desktop\効果測定PJT\広告効果測定用\効果測定インポート用.xlsx"
+# ★ 変更: 出力ファイルの拡張子を .xlsx に変更
+OUTPUT_FILE = r"C:\Users\yutaro.abe\Desktop\効果測定PJT\広告効果測定用\効果測定結果.xlsx"
+
+# 並列実行数
+MAX_WORKERS = 8 
+
 # ============================================================
 
 def create_query(anken_id_val, shop_id, item_id, easy_id_list, start_date, end_date):
-    """BigQueryクエリを生成する"""
-    easy_id_str = ', '.join(map(str, easy_id_list)) if easy_id_list else 'NULL'
+    """BigQueryクエリを生成する（変更なし）"""
+    
+    easy_id_str = ', '.join(map(str, easy_id_list)) if easy_id_list else 'NULL' 
     
     # 日付オブジェクトへの変換
     start_date_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    end_date_dt = datetime.strptime(end_date, '%Y-%m-%d')
     
     # --- 日付計算ロジック ---
     # sale_end_datetime: E列 + 1日 00:00:00
-    end_date_input_dt = datetime.strptime(end_date, '%Y-%m-%d')
-    sale_end_date = (end_date_input_dt + timedelta(days=1)).strftime('%Y-%m-%d')
-    
+    sale_end_date = (end_date_dt + timedelta(days=1)).strftime('%Y-%m-%d')
     # end_datetime: D列(開始日) の1ヶ月後 00:00:00
     end_date_plus1month = (start_date_dt + relativedelta(months=1)).strftime('%Y-%m-%d')
     
@@ -166,8 +177,12 @@ ORDER BY 3 desc;
 """
     return query
 
+
 def process_single_group(client, group_data, passthrough_cols):
-    """1つのグループに対する処理"""
+    """
+    1つのグループに対する処理（並列実行用）
+    passthrough_cols: 自動転記する列名のリスト
+    """
     try:
         idx, group_key, group = group_data
         anken_id, anken_name, shop_id, item_id, start_date, end_date = group_key
@@ -207,20 +222,25 @@ def process_single_group(client, group_data, passthrough_cols):
             result_df['紹介開始日'] = start_date_str
             result_df['紹介終了日'] = end_date_str
             
-            # 自動転記ロジック
-            reward_amount = 0
+            # ★★★ 自動転記ロジック ★★★
+            # グループ内の最初の行から値を取得して全行にコピー
+            reward_amount = 0 # 確定報酬金額の初期化
             for col in passthrough_cols:
                 val = group[col].iloc[0]
                 result_df[col] = val
                 
+                # 「確定報酬金額」列の値を取得しておく（カラム名が異なる場合は適宜修正してください）
                 if col == '確定報酬金額':
                     reward_amount = pd.to_numeric(val, errors='coerce')
 
-            # ROAS計算ロジック
+            # ★★★ ROAS計算ロジック（ここを修正しました）★★★
+            # 確定報酬金額が有効な数値の場合のみ計算
             if pd.notna(reward_amount) and reward_amount > 0:
+                # 計算結果をパーセント表記の文字列に変換（整数部分のみ表示）
                 result_df['個別ROAS'] = ((result_df['Sale_GMS'] / reward_amount) * 100).fillna(0).astype(int).astype(str) + '%'
                 result_df['個別Monthly ROAS'] = ((result_df['Monthly_GMS'] / reward_amount) * 100).fillna(0).astype(int).astype(str) + '%'
             else:
+                # 報酬金額が0または無効な場合は"0%"を設定
                 result_df['個別ROAS'] = "0%"
                 result_df['個別Monthly ROAS'] = "0%"
             
@@ -229,132 +249,112 @@ def process_single_group(client, group_data, passthrough_cols):
             return None
 
     except Exception as e:
-        # エラー発生時はエラー情報を返す
-        return {"error": str(e), "anken_id": anken_id}
+        print(f"\n[Error] AnkenID:{anken_id} - {str(e)}")
+        return None
 
-# ============================================================
-# メイン処理 (Streamlit UI)
-# ============================================================
 
-st.title("広告効果測定 BQ実行ツール")
-st.markdown("""
-Excelファイルをアップロードすると、BigQueryを実行して効果測定結果を集計します。
-""")
-
-# サイドバー設定
-st.sidebar.header("設定")
-PROJECT_ID = st.sidebar.text_input("Project ID", value="spdb-cm-cc-ichiba2")
-MAX_WORKERS = st.sidebar.number_input("並列実行数", min_value=1, max_value=32, value=8)
-
-# ファイルアップロード
-uploaded_file = st.file_uploader("インポート用Excelファイルをアップロード", type=["xlsx"])
-
-if uploaded_file is not None:
-    # データ読み込み
+def main():
+    """メイン処理"""
+    print("=" * 80)
+    print("BigQueryクエリ実行スクリプト - 効果測定PJT（並列高速化・動的カラム対応版）")
+    print(f"並列数: {MAX_WORKERS}")
+    print("=" * 80)
+    
+    # 1. 入力ファイルの読み込み
+    print(f"1. 入力ファイルを読み込み中... {INPUT_FILE}")
     try:
-        df_input = pd.read_excel(uploaded_file)
-        st.success(f"ファイル読み込み成功: {len(df_input)} 行")
+        df_input = pd.read_excel(INPUT_FILE)
     except Exception as e:
-        st.error(f"ファイル読み込みエラー: {e}")
-        st.stop()
+        print(f"エラー: {e}")
+        sys.exit(1)
+    
+    # 列名の整理
+    df_input.columns = df_input.columns.str.strip()
+    column_rename_map = {
+        'EasyID': 'easy_id', 'shopID': 'shop_id', 'itemID': 'item_id',
+        'SNS紹介開始日': '紹介開始日', 'SNS紹介終了日': '紹介終了日'
+    }
+    actual_rename_map = {k: v for k, v in column_rename_map.items() if k in df_input.columns}
+    df_input = df_input.rename(columns=actual_rename_map)
 
-    # 実行ボタン
-    if st.button("集計開始"):
-        # BigQueryクライアント初期化
-        try:
-            if "gcp_service_account_json" in st.secrets:
-                json_str = st.secrets["gcp_service_account_json"]
-                key_dict = json.loads(json_str)
-                creds = service_account.Credentials.from_service_account_info(key_dict)
-                client = bigquery.Client(credentials=creds, project=PROJECT_ID)
-            else:
-                client = bigquery.Client(project=PROJECT_ID)
-                st.info("ローカル認証情報を使用しています。")
-        except Exception as e:
-            st.error(f"BigQuery接続エラー: {e}")
-            st.info("Secrets設定を確認してください。")
-            st.stop()
+    # 案件IDの文字列化
+    if '案件ID' in df_input.columns:
+        df_input['案件ID'] = df_input['案件ID'].astype(str).str.strip()
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        error_logs = []
+    # ★★★ 動的カラム検出ロジック ★★★
+    # グループ化や集計に使わない、その他の列（付加情報）を特定する
+    grouping_keys = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
+    exclude_keys = ['easy_id'] # 集計対象なので除外
+    
+    # 入力Excelにある列のうち、グループキーでもeasy_idでもない列をリストアップ
+    passthrough_cols = [c for c in df_input.columns if c not in grouping_keys and c not in exclude_keys]
+    
+    print(f"   ★ 自動検出された付加情報カラム: {passthrough_cols}")
+    print("      （確定報酬、担当、店舗URLなどがここに含まれます）")
 
-        # --- 前処理 ---
-        status_text.text("データを前処理中...")
+    # 2. データのグループ化
+    grouped = df_input.groupby(grouping_keys)
+    total_groups = len(grouped)
+    print(f"   対象グループ数: {total_groups}")
+
+    # 3. BigQueryクライアント
+    try:
+        client = bigquery.Client(project=PROJECT_ID)
+    except Exception as e:
+        print(f"BQ接続エラー: {e}")
+        sys.exit(1)
+
+    # 4. 並列処理でクエリ実行
+    print("4. クエリを並列実行中...")
+    all_results = []
+    
+    # グループデータをリスト化
+    group_data_list = [(i, k, v) for i, (k, v) in enumerate(grouped, 1)]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # passthrough_cols も引数として渡す
+        futures = [executor.submit(process_single_group, client, data, passthrough_cols) for data in group_data_list]
         
-        df_input.columns = df_input.columns.str.strip()
-        column_rename_map = {
-            'EasyID': 'easy_id', 'shopID': 'shop_id', 'itemID': 'item_id',
-            'SNS紹介開始日': '紹介開始日', 'SNS紹介終了日': '紹介終了日'
-        }
-        actual_rename_map = {k: v for k, v in column_rename_map.items() if k in df_input.columns}
-        df_input = df_input.rename(columns=actual_rename_map)
-
-        if '案件ID' in df_input.columns:
-            df_input['案件ID'] = df_input['案件ID'].astype(str).str.strip()
-
-        grouping_keys = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
-        exclude_keys = ['easy_id']
-        passthrough_cols = [c for c in df_input.columns if c not in grouping_keys and c not in exclude_keys]
-        
-        grouped = df_input.groupby(grouping_keys)
-        total_groups = len(grouped)
-        st.info(f"対象グループ数: {total_groups}")
-
-        # --- 並列処理実行 ---
-        all_results = []
-        group_data_list = [(i, k, v) for i, (k, v) in enumerate(grouped, 1)]
-        
-        completed_count = 0
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_single_group, client, data, passthrough_cols) for data in group_data_list]
-            
-            for future in as_completed(futures):
-                res = future.result()
-                if res is not None:
-                    if isinstance(res, dict) and "error" in res:
-                        # エラー情報を収集
-                        error_logs.append(f"案件ID: {res['anken_id']} - Error: {res['error']}")
-                    else:
-                        all_results.append(res)
-                
-                completed_count += 1
-                progress = completed_count / total_groups
-                progress_bar.progress(progress)
-                status_text.text(f"処理中... {completed_count}/{total_groups} 完了")
-
-        # --- 結果結合と出力 ---
-        if error_logs:
-            st.error("以下のエラーが発生しました:")
-            for log in error_logs:
-                st.write(log)
-
-        if not all_results:
-            st.warning("有効な結果が0件でした。")
+        if tqdm:
+            iterator = tqdm(as_completed(futures), total=len(futures), unit="query")
         else:
-            status_text.text("結果ファイルを作成中...")
-            df_final = pd.concat(all_results, ignore_index=True)
+            iterator = as_completed(futures)
 
-            fixed_headers = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
-            user_headers = ['easy_id', 'fullname']
-            metric_headers = [c for c in df_final.columns if c not in fixed_headers and c not in passthrough_cols and c not in user_headers and c not in ['個別ROAS', '個別Monthly ROAS']]
-            
-            final_order = fixed_headers + passthrough_cols + user_headers + metric_headers + ['個別ROAS', '個別Monthly ROAS']
-            final_order = [c for c in final_order if c in df_final.columns]
-            
-            df_final = df_final[final_order]
+        for future in iterator:
+            res = future.result()
+            if res is not None:
+                all_results.append(res)
 
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_final.to_excel(writer, index=False)
-            
-            buffer.seek(0)
-            
-            st.success("集計完了！以下のボタンからダウンロードしてください。")
-            st.download_button(
-                label="結果Excelをダウンロード",
-                data=buffer,
-                file_name=f"効果測定結果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    # 5. 結果の結合と保存
+    print("\n5. 結果を結合・保存中...")
+    if not all_results:
+        print("結果が0件でした。")
+        sys.exit(0)
+
+    df_final = pd.concat(all_results, ignore_index=True)
+
+    # 列順序の整理（動的カラムを基本情報の後に挿入）
+    fixed_headers = ['案件ID', '案件名', 'shop_id', 'item_id', '紹介開始日', '紹介終了日']
+    user_headers = ['easy_id', 'fullname']
+    
+    # 数値データ（BigQueryから返ってきたその他のカラム）
+    # ROAS系カラムを除外して取得
+    metric_headers = [c for c in df_final.columns if c not in fixed_headers and c not in passthrough_cols and c not in user_headers and c not in ['個別ROAS', '個別Monthly ROAS']]
+    
+    # 最終的な並び順 (ROASを最後に追加)
+    final_order = fixed_headers + passthrough_cols + user_headers + metric_headers + ['個別ROAS', '個別Monthly ROAS']
+    final_order = [c for c in final_order if c in df_final.columns] # 存在チェック
+    
+    df_final = df_final[final_order]
+
+    try:
+        # ★ 変更: Excelファイルとして保存
+        # index=Falseでインデックス番号を出力しない
+        df_final.to_excel(OUTPUT_FILE, index=False)
+        print(f"✓ 保存完了: {OUTPUT_FILE}")
+        print(f"取得行数: {len(df_final)}")
+    except Exception as e:
+        print(f"保存エラー: {e}")
+
+if __name__ == "__main__":
+    main()
