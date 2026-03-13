@@ -263,9 +263,14 @@ if uploaded_file is not None:
         try:
             # Streamlit CloudのSecretsから認証情報を取得
             if "gcp_service_account" in st.secrets:
-                creds = service_account.Credentials.from_service_account_info(
-                    st.secrets["gcp_service_account"]
-                )
+                # 辞書として取得 (SecretsがDictLikeである場合に対応)
+                key_dict = dict(st.secrets["gcp_service_account"])
+                
+                # private_keyの改行コードを修正 (\nという文字を実際の改行に置換)
+                if "private_key" in key_dict:
+                    key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+
+                creds = service_account.Credentials.from_service_account_info(key_dict)
                 client = bigquery.Client(credentials=creds, project=PROJECT_ID)
             else:
                 # ローカル環境などでSecretsがない場合は、デフォルト認証(gcloud auth login)を試行
